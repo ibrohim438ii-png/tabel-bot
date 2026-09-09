@@ -1,4 +1,5 @@
 import os
+import math
 import threading
 import datetime
 import requests
@@ -12,6 +13,19 @@ FIREBASE_URL = os.environ.get(
     "https://tab-munis-default-rtdb.asia-southeast1.firebasedatabase.app"
 ).rstrip("/")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+WORKPLACE_LAT = float(os.environ.get("WORKPLACE_LAT", "40.979000"))
+WORKPLACE_LON = float(os.environ.get("WORKPLACE_LON", "71.705056"))
+RADIUS_M = float(os.environ.get("RADIUS_M", "300"))
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
 
 # ---------------- FIREBASE HELPERS ----------------
 def clean_phone(p):
@@ -52,7 +66,10 @@ def get_attendance(emp_id, date_key):
     return None
 
 # ---------------- KEYBOARDS ----------------
-MAIN_KB = ReplyKeyboardMarkup([[KeyboardButton("✅ Ishga keldim")]], resize_keyboard=True)
+MAIN_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📍 Ishga keldim", request_location=True)]],
+    resize_keyboard=True
+)
 CONTACT_KB = ReplyKeyboardMarkup(
     [[KeyboardButton("📱 Raqamni yuborish", request_contact=True)]],
     resize_keyboard=True, one_time_keyboard=True
@@ -92,8 +109,7 @@ async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "tekshirib, keyin qaytadan /start bosing."
         )
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip().lower()
+async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     emp_id, emp = find_employee_by_telegram_id(tg_id)
 
@@ -101,23 +117,50 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Avval ro'yxatdan o'ting: /start buyrug'ini bosing.")
         return
 
-    if "keldim" in text or "keldi" in text:
-        today = datetime.date.today().isoformat()
-        existing = get_attendance(emp_id, today)
-        if existing == "keldi":
-            await update.message.reply_text(f"Bugun ({today}) allaqachon \"Keldi\" deb belgilangansiz. ✅")
-            return
-        mark_attendance(emp_id, today, "keldi")
-        now_str = datetime.datetime.now().strftime("%H:%M")
+    loc = update.message.location
+    distance = haversine_m(loc.latitude, loc.longitude, WORKPLACE_LAT, WORKPLACE_LON)
+
+    if distance > RADIUS_M:
         await update.message.reply_text(
-            f"✅ Qabul qilindi, {emp.get('name','')}!\n"
-            f"Bugungi ({today}, soat {now_str}) davomatingiz \"Keldi\" deb belgilandi."
+            f"❌ Siz ish joyidan {int(distance)} metr uzoqdasiz.\n"
+            f"Davomat faqat ish joyida turib belgilanadi. Ish joyiga yetgach, qaytadan urinib ko'ring."
         )
-    else:
-        await update.message.reply_text(
-            "Ishga kelganingizni belgilash uchun pastdagi \"✅ Ishga keldim\" tugmasini bosing.",
-            reply_markup=MAIN_KB
-        )
+        if ADMIN_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"⚠️ {emp.get('name','')} \"Ishga keldim\" deb yozdi, lekin ish joyidan "
+                    f"{int(distance)} metr uzoqda edi (belgilanmadi)."
+                )
+            except Exception:
+                pass
+        return
+
+    today = datetime.date.today().isoformat()
+    existing = get_attendance(emp_id, today)
+    if existing == "keldi":
+        await update.message.reply_text(f"Bugun ({today}) allaqachon \"Keldi\" deb belgilangansiz. ✅")
+        return
+
+    mark_attendance(emp_id, today, "keldi")
+    now_str = datetime.datetime.now().strftime("%H:%M")
+    await update.message.reply_text(
+        f"✅ Qabul qilindi, {emp.get('name','')}!\n"
+        f"Bugungi ({today}, soat {now_str}) davomatingiz \"Keldi\" deb belgilandi.\n"
+        f"(Ish joyidan {int(distance)} m masofada tasdiqlandi)"
+    )
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    emp_id, emp = find_employee_by_telegram_id(tg_id)
+    if not emp_id:
+        await update.message.reply_text("Avval ro'yxatdan o'ting: /start buyrug'ini bosing.")
+        return
+    await update.message.reply_text(
+        "Ishga kelganingizni belgilash uchun pastdagi \"📍 Ishga keldim\" tugmasini bosing "
+        "(joylashuvingiz so'raladi).",
+        reply_markup=MAIN_KB
+    )
 
 # ---------------- KEEP-ALIVE WEB SERVER (Render free tier) ----------------
 flask_app = Flask(__name__)
@@ -143,6 +186,7 @@ def main():
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    application.add_handler(MessageHandler(filters.LOCATION, location_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     print("Bot ishga tushdi...")
