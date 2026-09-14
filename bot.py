@@ -68,8 +68,13 @@ def find_employee_by_telegram_id(tg_id):
 def set_employee_telegram_id(emp_id, tg_id):
     requests.patch(f"{FIREBASE_URL}/employees/{emp_id}.json", json={"telegramId": str(tg_id)}, timeout=10)
 
-def mark_attendance(emp_id, date_key, status, hours):
-    requests.put(f"{FIREBASE_URL}/attendance/{emp_id}/{date_key}.json", json={"s": status, "h": hours}, timeout=10)
+def mark_attendance(emp_id, date_key, status, hours, arr=None, dep=None):
+    payload = {"s": status, "h": hours}
+    if arr is not None:
+        payload["arr"] = arr
+    if dep is not None:
+        payload["dep"] = dep
+    requests.put(f"{FIREBASE_URL}/attendance/{emp_id}/{date_key}.json", json=payload, timeout=10)
 
 def get_attendance(emp_id, date_key):
     r = requests.get(f"{FIREBASE_URL}/attendance/{emp_id}/{date_key}.json", timeout=10)
@@ -79,7 +84,10 @@ def get_attendance(emp_id, date_key):
 
 # ---------------- KEYBOARDS ----------------
 MAIN_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton("📍 Ishga keldim", request_location=True)]],
+    [
+        [KeyboardButton("📍 Ishga keldim", request_location=True)],
+        [KeyboardButton("🚪 Ishdan ketdim")]
+    ],
     resize_keyboard=True
 )
 CONTACT_KB = ReplyKeyboardMarkup(
@@ -151,8 +159,9 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     hours, lateness = compute_hours_worked(today_dt)
-    mark_attendance(emp_id, today, "keldi", hours)
-    now_str = today_dt.strftime("%H:%M")
+    arr_str = today_dt.strftime("%H:%M")
+    mark_attendance(emp_id, today, "keldi", hours, arr=arr_str)
+    now_str = arr_str
 
     if lateness > 0:
         msg = (
@@ -178,14 +187,61 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
     tg_id = update.effective_user.id
     emp_id, emp = find_employee_by_telegram_id(tg_id)
     if not emp_id:
         await update.message.reply_text("Avval ro'yxatdan o'ting: /start buyrug'ini bosing.")
         return
+
+    if "ketdim" in text.lower():
+        today_dt = datetime.datetime.now(TASHKENT_TZ)
+        today = today_dt.date().isoformat()
+        existing = get_attendance(emp_id, today)
+
+        if not existing or existing.get("s") != "keldi" or not existing.get("arr"):
+            await update.message.reply_text(
+                "Siz bugun hali \"Ishga keldim\" deb belgilamagansiz.",
+                reply_markup=MAIN_KB
+            )
+            return
+
+        if existing.get("dep"):
+            await update.message.reply_text(
+                f"Bugun allaqachon soat {existing['dep']} da ketgan deb belgilangansiz. "
+                f"Jami ishlagan soat: {existing.get('h')}."
+            )
+            return
+
+        arr_h, arr_m = map(int, existing["arr"].split(":"))
+        arr_dt = today_dt.replace(hour=arr_h, minute=arr_m, second=0, microsecond=0)
+        actual_hours = max(0.0, (today_dt - arr_dt).total_seconds() / 3600)
+        actual_hours = round(actual_hours * 2) / 2  # 0.5 soatgacha yaxlitlash
+        actual_hours = min(actual_hours, FULL_DAY_HOURS)
+
+        dep_str = today_dt.strftime("%H:%M")
+        mark_attendance(emp_id, today, "keldi", actual_hours, arr=existing["arr"], dep=dep_str)
+
+        await update.message.reply_text(
+            f"👋 Xayr, {emp.get('name','')}!\n"
+            f"Kelgan: {existing['arr']} — Ketgan: {dep_str}\n"
+            f"Bugungi jami ishlagan soatingiz: {actual_hours} soat.",
+            reply_markup=MAIN_KB
+        )
+        if ADMIN_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"ℹ️ {emp.get('name','')}: {existing['arr']} - {dep_str} "
+                    f"(jami {actual_hours} soat)."
+                )
+            except Exception:
+                pass
+        return
+
     await update.message.reply_text(
-        "Ishga kelganingizni belgilash uchun pastdagi \"📍 Ishga keldim\" tugmasini bosing "
-        "(joylashuvingiz so'raladi).",
+        "Ishga kelganingizni belgilash uchun \"📍 Ishga keldim\" tugmasini, "
+        "ketayotganda \"🚪 Ishdan ketdim\" tugmasini bosing.",
         reply_markup=MAIN_KB
     )
 
